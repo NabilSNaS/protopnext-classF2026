@@ -162,6 +162,8 @@ Training alternates between multiple phases:
 - **Project**: Update prototypes to match training examples
 - **Last-only**: Train only the classification head
 
+Which components train in each phase, how many epochs each phase runs, and the learning rate of each component can be changed per phase; see [Configuring the Training Schedule](#configuring-the-training-schedule).
+
 ### Early Stopping
 
 Custom early stopping for prototype models:
@@ -187,6 +189,77 @@ python -m protopnet eval models.csv --dataset cub200 --output results.csv
 python -m protopnet visualization model.pth --dataset cub200
 ```
 
+### Configuring the Training Schedule
+
+`train-protopnet` trains in stages: **warm** → **joint** → **project** → a repeated cycle of (**last_only** → **joint** → **project**) → a final **last_only** stage.
+The options below change one stage at a time.
+Every option is optional: if you leave it out, that stage keeps the original ProtoPNet setting, so existing commands behave exactly as before.
+
+Component names used by these options:
+
+| Name | Component |
+|---|---|
+| `backbone` | feature extractor (e.g. ResNet) |
+| `add_on_layers` | add-on layers between backbone and prototypes |
+| `prototype_layer` | the prototype vectors |
+| `prototype_prediction_head` | final classification layer |
+
+#### Which components train in each stage
+
+| Option | Default |
+|---|---|
+| `--warm-trainable` | `add_on_layers,prototype_layer` |
+| `--joint-trainable` | `backbone,add_on_layers,prototype_layer` |
+| `--last-only-trainable` | `prototype_prediction_head` |
+| `--freeze-batchnorm` | off |
+
+Give a comma-separated list (no spaces) of the components to train; all other components are frozen for that stage.
+Each stage's optimizer contains exactly its trainable components.
+`--freeze-batchnorm` also keeps the BatchNorm running statistics of frozen components fixed; `requires_grad=False` alone does not stop them from changing.
+
+#### Epochs per stage
+
+| Option | Default |
+|---|---|
+| `--warm-epochs` | 5 |
+| `--preproject-joint-epochs` | 5 |
+| `--joint-epochs-per-cycle` | 5 |
+| `--last-only-epochs-per-cycle` | 10 |
+| `--num-cycles` | 20 |
+| `--final-last-only-epochs` | same as `--last-only-epochs-per-cycle` |
+
+All epoch counts are multiplied by `--phase-multiplier`. A stage set to `0` is skipped. `--verify` ignores these options and runs one epoch per stage.
+
+#### Learning rate per stage
+
+| Option | Stage |
+|---|---|
+| `--warm-lr` | warm |
+| `--joint-lr` | joint |
+| `--last-only-lr` | last_only |
+
+Give `component=rate` pairs separated by commas, e.g. `--joint-lr add_on_layers=0.001,backbone=0.00005`.
+Components you do not list keep their normal rate (`backbone` 1e-4, `add_on_layers` 3e-3, `prototype_layer` 3e-3, `prototype_prediction_head` 1e-4, each scaled by `--lr-multiplier`).
+Rates given here are used as written and are **not** scaled by `--lr-multiplier`.
+A rate can only be set for a component that trains in that stage; the joint stage's step-decay scheduler starts from the rate you set.
+
+#### Examples
+
+```bash
+# Also train the add-on layers in the last-only stages, with their own learning rate
+python -m protopnet train-protopnet --last-only-trainable prototype_prediction_head,add_on_layers --last-only-lr add_on_layers=0.0005
+
+# Skip warm-up, keep the backbone frozen throughout, and run a short schedule
+python -m protopnet train-protopnet --warm-epochs 0 --joint-trainable add_on_layers,prototype_layer --num-cycles 2 --final-last-only-epochs 15
+
+# Freeze BatchNorm statistics in frozen components
+python -m protopnet train-protopnet --freeze-batchnorm
+```
+
+To check a configuration without training, add `--dry-run`: the resolved schedule and a `Learning rates per stage` line are printed to the log.
+
+Invalid settings stop the run before training with a clear error, for example a misspelled component name (`--warm-trainable backbon`), a negative epoch count, or a learning rate for a component that is frozen in that stage (`--warm-lr backbone=0.1`).
+
 ## Datasets
 
 Available datasets:
@@ -210,6 +283,26 @@ For example, the `ProtoPNetTrainingSchedule` has the following layout:
 - **Joint**: `ClassificationBackpropPhase` training all layers
 - **Project**: `ProjectPhase` - one epoch updating the prototypes to match the closest sample patches
 - **Last-only**: `ClassificationBackpropPhase` training only the classification head
+
+The same options as the CLI are available as arguments of `ProtoPNetTrainingSchedule`:
+
+```python
+schedule = ProtoPNetTrainingSchedule(
+    ...,
+    num_warm_epochs=0,                          # 0 skips the stage
+    final_last_only_epochs=30,                  # default: last_only_epochs_per_project
+    trainable_components={"last_only": ["prototype_prediction_head", "add_on_layers"]},
+    stage_learning_rates={"last_only": {"add_on_layers": 5e-4}},
+    freeze_batchnorm=True,
+)
+schedule.stage_trainable_components  # resolved components per stage
+schedule.stage_learning_rates        # resolved learning rates per stage
+```
+
+Which layers a `ClassificationBackpropPhase` trains is set by its `set_training_layers_fn`:
+
+- `TrainLayersByComponent(trainable=[...], freeze_batchnorm=False)` trains the listed top-level components and freezes the rest. Unknown component names raise an error.
+- `TrainOptimizerLayers()` (the default) trains exactly the parameters in the phase's optimizer, across all of its parameter groups.
 
 ## Contributors
 

@@ -30,6 +30,91 @@ log = logging.getLogger(__name__)
     type=int,
     default=10,
 )
+# Number of epochs for each stage. Leave a flag out to keep the
+# original value. All counts are multiplied by --phase-multiplier.
+@click.option(
+    "--warm-epochs",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Warm-up epochs. 0 skips warm-up. Default: 5.",
+)
+@click.option(
+    "--preproject-joint-epochs",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Joint epochs before the first project step. 0 skips them. Default: 5.",
+)
+@click.option(
+    "--joint-epochs-per-cycle",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Joint epochs inside each repeated cycle. Default: 5.",
+)
+@click.option(
+    "--last-only-epochs-per-cycle",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Last-layer epochs inside each repeated cycle. Default: 10.",
+)
+@click.option(
+    "--num-cycles",
+    type=click.IntRange(min=0),
+    default=None,
+    help="How many times to repeat (last-only -> joint -> project). Default: 20.",
+)
+@click.option(
+    "--final-last-only-epochs",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Last-layer epochs in the final stage. Default: same as --last-only-epochs-per-cycle.",
+)
+# Choose which components each stage trains (comma-separated names).
+# Leave a flag out to keep that stage's original setting.
+@click.option(
+    "--warm-trainable",
+    type=str,
+    default=None,
+    help="Components trained during warm-up, e.g. 'add_on_layers,prototype_layer'.",
+)
+@click.option(
+    "--joint-trainable",
+    type=str,
+    default=None,
+    help="Components trained during joint stages, e.g. 'backbone,add_on_layers,prototype_layer'.",
+)
+@click.option(
+    "--last-only-trainable",
+    type=str,
+    default=None,
+    help="Components trained during last-layer stages, e.g. 'prototype_prediction_head'.",
+)
+# Learning rate of a component in one stage, as "component=rate" pairs.
+# Leave a flag out to keep the normal rates (these values are NOT scaled by --lr-multiplier).
+@click.option(
+    "--warm-lr",
+    type=str,
+    default=None,
+    help="Learning rates during warm-up, e.g. 'add_on_layers=0.003,prototype_layer=0.003'.",
+)
+@click.option(
+    "--joint-lr",
+    type=str,
+    default=None,
+    help="Learning rates during joint stages, e.g. 'backbone=0.0001,add_on_layers=0.001'.",
+)
+@click.option(
+    "--last-only-lr",
+    type=str,
+    default=None,
+    help="Learning rates during last-layer stages, e.g. 'prototype_prediction_head=0.0001'.",
+)
+# Keep BatchNorm statistics fixed in frozen components
+@click.option(
+    "--freeze-batchnorm",
+    is_flag=True,
+    default=False,
+    help="Keep BatchNorm running statistics fixed in frozen components.",
+)
 def run(
     *,
     backbone="resnet50[pretraining=inaturalist]",
@@ -59,6 +144,19 @@ def run(
     run_id=None,
     activation_function="l2",
     k_for_topk=1,
+    warm_trainable=None,
+    joint_trainable=None,
+    last_only_trainable=None,
+    freeze_batchnorm=False,
+    warm_epochs=None,
+    preproject_joint_epochs=None,
+    joint_epochs_per_cycle=None,
+    last_only_epochs_per_cycle=None,
+    num_cycles=None,
+    final_last_only_epochs=None,
+    warm_lr=None,
+    joint_lr=None,
+    last_only_lr=None,
 ):
     """
     Train a Vanilla ProtoPNet.
@@ -86,7 +184,27 @@ def run(
     - dataset: str - name of the dataset to use
     - save_on_proto_updates: bool - whether or not to save intermediate models to run pacmap on
     - rsample_init: bool - whether to initialize prototypes as random parts of the training data images (True), instead of as random vectors of the correct length (False)
+    - warm_trainable / joint_trainable / last_only_trainable: str - comma-separated components each stage trains
+      (backbone, add_on_layers, prototype_layer, prototype_prediction_head). None keeps the original setting.
+    - freeze_batchnorm: bool - keep BatchNorm running statistics fixed in frozen components
+    - warm_epochs / preproject_joint_epochs: int - epochs for warm-up / joint-before-first-project.
+      None = pre_project_phase_len. 0 skips the stage.
+    - joint_epochs_per_cycle / last_only_epochs_per_cycle / num_cycles: int - override
+      joint_epochs_per_phase / last_only_epochs_per_phase / post_project_phases.
+    - final_last_only_epochs: int - last-layer epochs in the final stage. None = last-only-per-cycle.
+      All epoch counts are multiplied by phase_multiplier.
+    - warm_lr / joint_lr / last_only_lr: str - per-stage learning rates as
+      "component=rate,component=rate". Components not listed keep their normal rate.
+      Only components that train in that stage can be given a rate. Not scaled by lr_multiplier.
     """
+
+    # Per-stage flags override the shared defaults when given
+    if joint_epochs_per_cycle is not None:
+        joint_epochs_per_phase = joint_epochs_per_cycle
+    if last_only_epochs_per_cycle is not None:
+        last_only_epochs_per_phase = last_only_epochs_per_cycle
+    if num_cycles is not None:
+        post_project_phases = num_cycles
 
     if verify:
         log.info("Running in verification mode to check training will run all phases")
@@ -95,6 +213,8 @@ def run(
         joint_epochs_per_phase = 1
         last_only_epochs_per_phase = 1
         phase_multiplier = 1
+        # verify mode ignores per-stage epoch flags (always 1 epoch per stage)
+        warm_epochs = preproject_joint_epochs = final_last_only_epochs = None
         latent_dim_multiplier_exp = -2
         proto_channels = None
         num_prototypes_per_class = 5
@@ -180,8 +300,15 @@ def run(
         loss=protopnet_loss,
         last_only_loss=protopnet_loss,
         num_accumulation_batches=num_accumulation_batches,
-        num_warm_epochs=pre_project_phase_len * phase_multiplier,
-        num_preproject_joint_epochs=pre_project_phase_len * phase_multiplier,
+        # Each can be set on its own; falls back to pre_project_phase_len
+        num_warm_epochs=(pre_project_phase_len if warm_epochs is None else warm_epochs)
+        * phase_multiplier,
+        num_preproject_joint_epochs=(
+            pre_project_phase_len
+            if preproject_joint_epochs is None
+            else preproject_joint_epochs
+        )
+        * phase_multiplier,
         backbone_lr=1e-4 * lr_multiplier,
         add_on_lr=0.003 * lr_multiplier,
         prototype_lr=0.003 * lr_multiplier,
@@ -192,6 +319,32 @@ def run(
         last_only_epochs_per_project=last_only_epochs_per_phase * phase_multiplier,
         joint_epochs_per_phase=joint_epochs_per_phase * phase_multiplier,
         post_project_phases=post_project_phases,
+        # Own length for the final last-only stage
+        final_last_only_epochs=(
+            None
+            if final_last_only_epochs is None
+            else final_last_only_epochs * phase_multiplier
+        ),
+        # Pass only the stages the user actually set; the rest keep their defaults
+        trainable_components={
+            stage: components
+            for stage, components in (
+                ("warm", warm_trainable),
+                ("joint", joint_trainable),
+                ("last_only", last_only_trainable),
+            )
+            if components is not None
+        },
+        freeze_batchnorm=freeze_batchnorm,
+        stage_learning_rates={
+            stage: rates
+            for stage, rates in (
+                ("warm", warm_lr),
+                ("joint", joint_lr),
+                ("last_only", last_only_lr),
+            )
+            if rates is not None
+        },
         phase_config_kwargs={
             "device": setup["device"],
             "post_forward_calculations": post_forward_calculations,
@@ -207,6 +360,9 @@ def run(
             device=setup["device"],
         ),
     )
+
+    # Print the learning rate of every component in every stage
+    log.info("Learning rates per stage: %s", training_schedule.stage_learning_rates)
 
     if verify:
         # add a prune epoch

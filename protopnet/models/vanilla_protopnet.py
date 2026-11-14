@@ -1,4 +1,5 @@
-from typing import Any, Dict, Optional
+import math
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -12,7 +13,7 @@ from ..train.scheduling.scheduling import (
     ClassificationBackpropPhase,
     ClassificationInferencePhase,
     ProjectPhase,
-    TrainLayersUsingProtoPNetNames,
+    TrainLayersByComponent,
 )
 from ..train.scheduling.types import IterativePhase, Phase, TrainingSchedule
 
@@ -62,6 +63,23 @@ class VanillaProtoPNet(ProtoPNet):
         )
 
 
+#: Components each backprop stage trains by default (the original ProtoPNet schedule).
+DEFAULT_TRAINABLE_COMPONENTS: Dict[str, Tuple[str, ...]] = {
+    "warm": ("add_on_layers", "prototype_layer"),
+    "joint": ("add_on_layers", "backbone", "prototype_layer"),
+    "last_only": ("prototype_prediction_head",),
+}
+
+#: Order of parameter groups in each stage's optimizer. Matches the original
+#: hand-written optimizers so that default runs are unchanged.
+_OPTIMIZER_GROUP_ORDER = (
+    "add_on_layers",
+    "backbone",
+    "prototype_layer",
+    "prototype_prediction_head",
+)
+
+
 class ProtoPNetTrainingSchedule(TrainingSchedule):
     def __init__(
         self,
@@ -85,6 +103,10 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         last_only_epochs_per_project: int = 20,
         joint_epochs_per_phase: int = 10,
         post_project_phases: int = 12,
+        final_last_only_epochs: Optional[int] = None,
+        trainable_components: Optional[Mapping[str, Iterable[str]]] = None,
+        freeze_batchnorm: bool = False,
+        stage_learning_rates: Optional[Mapping[str, Mapping[str, float]]] = None,
         phase_config_kwargs: Dict[str, Any] = {},
         extra_training_metrics: Optional[TrainingMetrics] = None,
     ):
@@ -104,9 +126,51 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
             - last_only_epochs_per_project: epochs after project where most features are frozen, only the prediction head trains
             - joint_epochs_per_phase: number of joint (end-to-end) training epochs before each projection step after warmups
             - post_project_phases: how many times to loop (last-only epochs -> joint (end-to-end) epochs -> project epochs) after the first project
+            - final_last_only_epochs: last-layer epochs in the very last stage,
+                after the loop. None = same as last_only_epochs_per_project (original behaviour).
+              Any stage with 0 epochs is left out of the schedule (e.g. num_warm_epochs=0 skips warm-up).
+            - trainable_components: which components each stage trains, keyed by
+                stage name ("warm", "joint", "last_only"). Stages you leave out keep their
+                defaults (DEFAULT_TRAINABLE_COMPONENTS). Example:
+                {"warm": ["prototype_layer"], "last_only": ["prototype_prediction_head", "add_on_layers"]}
+            - freeze_batchnorm: if True, BatchNorm layers in frozen components keep
+                their running statistics fixed during a stage
+            - stage_learning_rates: learning rate for a component in one stage,
+                keyed by stage then component. Anything not given uses the component's
+                normal rate (add_on_lr, backbone_lr, prototype_lr, pred_head_lr). Example:
+                {"joint": {"add_on_layers": 0.001}, "last_only": {"prototype_prediction_head": 0.0005}}
+                A rate can only be set for a component that trains in that stage.
         """
         if last_only_loss is None:
             last_only_loss = loss
+
+        # Merge user overrides with the defaults and check for typos
+        stage_trainable = resolve_trainable_components(trainable_components)
+
+        # The normal learning rate of each component
+        default_learning_rates = {
+            "add_on_layers": add_on_lr,
+            "backbone": backbone_lr,
+            "prototype_layer": prototype_lr,
+            "prototype_prediction_head": pred_head_lr,
+        }
+        # Final learning rate of every trainable component in every stage
+        stage_lrs = resolve_stage_learning_rates(
+            stage_learning_rates, stage_trainable, default_learning_rates
+        )
+
+        # Every epoch count must be a whole number >= 0
+        validate_epoch_counts(
+            num_warm_epochs=num_warm_epochs,
+            num_preproject_joint_epochs=num_preproject_joint_epochs,
+            last_only_epochs_per_project=last_only_epochs_per_project,
+            joint_epochs_per_phase=joint_epochs_per_phase,
+            post_project_phases=post_project_phases,
+            final_last_only_epochs=final_last_only_epochs,
+        )
+        # Not given -> same as before (final stage = in-loop last-only length)
+        if final_last_only_epochs is None:
+            final_last_only_epochs = last_only_epochs_per_project
 
         eval = ClassificationInferencePhase(
             name="eval",
@@ -124,44 +188,63 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
             **phase_config_kwargs,
         }
 
-        opt_conf_add_on = {
-            "params": model.add_on_layers.parameters(),
-            "lr": add_on_lr,
-            "weight_decay": weight_decay,
-        }
+        # Optimizer parameter group (params + learning rate) for one component in one stage
+        def param_group(component: str, stage: str) -> Dict[str, Any]:
+            lr = stage_lrs[stage][component]
+            if component == "add_on_layers":
+                return {
+                    "params": list(model.add_on_layers.parameters()),
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                }
+            if component == "backbone":
+                return {
+                    "params": list(model.backbone.parameters()),
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                }
+            if component == "prototype_layer":
+                return {
+                    "params": [model.prototype_layer.prototype_tensors],
+                    "lr": lr,
+                }
+            if component == "prototype_prediction_head":
+                return {
+                    # FIXME - shouldn't this be model.prototype_prediction_head.parameters()?
+                    "params": list(
+                        model.prototype_prediction_head.class_connection_layer.parameters()
+                    ),
+                    "lr": lr,
+                }
+            raise ValueError(f"No optimizer settings for component {component!r}")
 
-        opt_conf_proto = {
-            "params": model.prototype_layer.prototype_tensors,
-            "lr": prototype_lr,
-        }
+        # A stage's optimizer contains exactly the components it trains,
+        # so a component can never be "unfrozen but not updated"
+        def optimizer_for(stage: str) -> torch.optim.Optimizer:
+            trainable = stage_trainable[stage]
+            return torch.optim.Adam(
+                [
+                    param_group(c, stage)
+                    for c in _OPTIMIZER_GROUP_ORDER
+                    if c in trainable
+                ]
+            )
 
-        opt_conf_backbone = {
-            "params": model.backbone.parameters(),
-            "lr": backbone_lr,
-            "weight_decay": weight_decay,
-        }
-
-        opt_conf_head = {
-            # FIXME - shouldn't this be model.prototype_prediction_head.parameters()?
-            "params": model.prototype_prediction_head.class_connection_layer.parameters(),
-            "lr": pred_head_lr,
-        }
+        # Freezing rule for a stage
+        def layers_for(stage: str) -> TrainLayersByComponent:
+            return TrainLayersByComponent(
+                trainable=stage_trainable[stage], freeze_batchnorm=freeze_batchnorm
+            )
 
         warm = ClassificationBackpropPhase(
             name="warm",
-            optimizer=torch.optim.Adam([opt_conf_add_on, opt_conf_proto]),
-            set_training_layers_fn=TrainLayersUsingProtoPNetNames(
-                train_backbone=False,
-                train_add_on_layers=True,
-                train_prototype_layer=True,
-                train_prototype_prediction_head=False,
-            ),
+            optimizer=optimizer_for("warm"),
+            set_training_layers_fn=layers_for("warm"),
             **backprop_shared_config,
         )
 
-        joint_optimizer = torch.optim.Adam(
-            [opt_conf_add_on, opt_conf_backbone, opt_conf_proto]
-        )
+        # One joint optimizer (and LR scheduler) is shared by every joint stage, as before
+        joint_optimizer = optimizer_for("joint")
 
         joint = ClassificationBackpropPhase(
             name="joint",
@@ -171,12 +254,7 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
                 step_size=joint_lr_step_size,
                 gamma=joint_lr_step_gamma,
             ),
-            set_training_layers_fn=TrainLayersUsingProtoPNetNames(
-                train_backbone=True,
-                train_add_on_layers=True,
-                train_prototype_layer=True,
-                train_prototype_prediction_head=False,
-            ),
+            set_training_layers_fn=layers_for("joint"),
             **backprop_shared_config,
         )
 
@@ -184,13 +262,8 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         last_only_shared_config["loss"] = last_only_loss
         last_only = ClassificationBackpropPhase(
             name="last_only",
-            optimizer=torch.optim.Adam([opt_conf_head]),
-            set_training_layers_fn=TrainLayersUsingProtoPNetNames(
-                train_backbone=False,
-                train_add_on_layers=False,
-                train_prototype_layer=False,
-                train_prototype_prediction_head=True,
-            ),
+            optimizer=optimizer_for("last_only"),
+            set_training_layers_fn=layers_for("last_only"),
             **last_only_shared_config,
         )
 
@@ -198,17 +271,19 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
             dataloader=project_loader,
         )
 
+        # Add a stage only if it has at least 1 epoch
+        def stage(train, epochs: int = 1) -> List[Phase]:
+            return [Phase(train=train, duration=epochs)] if epochs > 0 else []
+
+        # The repeated loop: last-only -> joint -> project
+        cycle = [
+            *stage(last_only, last_only_epochs_per_project),
+            *stage(joint, joint_epochs_per_phase),
+            *stage(project),
+        ]
+
         maybe_iterative_phase = (
-            [
-                IterativePhase(
-                    phases=[
-                        Phase(train=last_only, duration=last_only_epochs_per_project),
-                        Phase(train=joint, duration=joint_epochs_per_phase),
-                        Phase(train=project),
-                    ],
-                    iterations=post_project_phases,
-                )
-            ]
+            [IterativePhase(phases=cycle, iterations=post_project_phases)]
             if post_project_phases > 0
             else []
         )
@@ -216,10 +291,163 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         super().__init__(
             default_eval_phase=eval,
             phases=[
-                Phase(train=warm, duration=num_warm_epochs),
-                Phase(train=joint, duration=num_preproject_joint_epochs),
-                Phase(train=project),
+                *stage(warm, num_warm_epochs),  # skipped if 0
+                *stage(joint, num_preproject_joint_epochs),  # skipped if 0
+                *stage(project),
                 *maybe_iterative_phase,
-                Phase(train=last_only, duration=last_only_epochs_per_project),
+                *stage(last_only, final_last_only_epochs),  # own epoch count
             ],
         )
+
+        # Keep the resolved settings so they can be printed or checked
+        self._stage_trainable = stage_trainable
+        self._stage_lrs = stage_lrs
+
+    @property
+    def stage_trainable_components(self) -> Dict[str, Tuple[str, ...]]:
+        """Components trained in each backprop stage."""
+        return dict(self._stage_trainable)
+
+    @property
+    def stage_learning_rates(self) -> Dict[str, Dict[str, float]]:
+        """Learning rate of each trainable component in each backprop stage."""
+        return {stage: dict(lrs) for stage, lrs in self._stage_lrs.items()}
+
+
+def resolve_trainable_components(
+    overrides: Optional[Mapping[str, Iterable[str]]],
+) -> Dict[str, Tuple[str, ...]]:
+    """
+    Merge per-stage trainable-component overrides onto DEFAULT_TRAINABLE_COMPONENTS.
+
+    Each value may be a list of component names or a comma-separated string.
+    Raises ValueError for unknown stages, unknown components or empty stages.
+    """
+    resolved = dict(DEFAULT_TRAINABLE_COMPONENTS)
+    if not overrides:
+        return resolved  # nothing given: original behaviour
+
+    # stage names must be warm / joint / last_only
+    unknown_stages = set(overrides) - set(DEFAULT_TRAINABLE_COMPONENTS)
+    if unknown_stages:
+        raise ValueError(
+            f"Unknown stage(s) {sorted(unknown_stages)} in trainable_components. "
+            f"Valid stages: {sorted(DEFAULT_TRAINABLE_COMPONENTS)}"
+        )
+
+    for stage_name, components in overrides.items():
+        # allow "a,b,c" strings (handy for the command line)
+        if isinstance(components, str):
+            components = [c for c in components.split(",") if c.strip()]
+        components = tuple(c.strip() for c in components)
+
+        # component names must be real ProtoPNet components
+        unknown = set(components) - set(_OPTIMIZER_GROUP_ORDER)
+        if unknown:
+            raise ValueError(
+                f"Unknown component(s) {sorted(unknown)} for stage {stage_name!r}. "
+                f"Valid components: {list(_OPTIMIZER_GROUP_ORDER)}"
+            )
+        # a stage that trains nothing is almost certainly a mistake
+        if not components:
+            raise ValueError(f"Stage {stage_name!r} has no trainable components.")
+
+        resolved[stage_name] = tuple(
+            c for c in _OPTIMIZER_GROUP_ORDER if c in components
+        )
+    return resolved
+
+
+def validate_epoch_counts(**counts: Optional[int]) -> None:
+    """Raise ValueError unless every count is None (use default) or a non-negative int."""
+    for name, value in counts.items():
+        if value is None:
+            continue  # None means "use the default"
+        # bool is a subclass of int in Python, so reject it explicitly
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+
+
+def resolve_stage_learning_rates(
+    overrides: Optional[Mapping[str, Any]],
+    stage_trainable: Mapping[str, Tuple[str, ...]],
+    default_learning_rates: Mapping[str, float],
+) -> Dict[str, Dict[str, float]]:
+    """
+    Learning rate of every trainable component in every stage.
+
+    Starts from each component's default rate and applies per-stage overrides.
+    Each override may be a ``{component: rate}`` mapping or a
+    ``"component=rate,component=rate"`` string. Raises ValueError for unknown
+    stages or components, for a rate given to a component that is frozen in
+    that stage, and for rates that are not positive finite numbers.
+    """
+    # start from the normal rates: this is exactly the original behaviour
+    resolved = {
+        stage: {c: default_learning_rates[c] for c in components}
+        for stage, components in stage_trainable.items()
+    }
+    if not overrides:
+        return resolved
+
+    # stage names must be warm / joint / last_only
+    unknown_stages = set(overrides) - set(stage_trainable)
+    if unknown_stages:
+        raise ValueError(
+            f"Unknown stage(s) {sorted(unknown_stages)} in stage_learning_rates. "
+            f"Valid stages: {sorted(stage_trainable)}"
+        )
+
+    for stage_name, rates in overrides.items():
+        # allow "component=rate,component=rate" strings (handy for the command line)
+        if isinstance(rates, str):
+            rates = parse_learning_rate_string(rates)
+
+        for component, lr in rates.items():
+            if component not in default_learning_rates:
+                raise ValueError(
+                    f"Unknown component {component!r} in learning rates for stage {stage_name!r}. "
+                    f"Valid components: {list(default_learning_rates)}"
+                )
+            # a rate for a frozen component would silently do nothing, so stop instead
+            if component not in stage_trainable[stage_name]:
+                raise ValueError(
+                    f"{component!r} is frozen in stage {stage_name!r}, so it cannot have a "
+                    f"learning rate there. Trainable in {stage_name!r}: "
+                    f"{list(stage_trainable[stage_name])}"
+                )
+            # rate must be a positive, finite number (bool is excluded on purpose)
+            if (
+                isinstance(lr, bool)
+                or not isinstance(lr, (int, float))
+                or not math.isfinite(lr)
+                or lr <= 0
+            ):
+                raise ValueError(
+                    f"Learning rate for {component!r} in stage {stage_name!r} must be a "
+                    f"positive number, got {lr!r}"
+                )
+            resolved[stage_name][component] = float(lr)
+    return resolved
+
+
+def parse_learning_rate_string(text: str) -> Dict[str, float]:
+    """Parse ``"add_on_layers=0.001,prototype_layer=0.003"`` into a dict of rates."""
+    rates = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Expected 'component=rate', got {item!r} "
+                "(example: add_on_layers=0.001,prototype_layer=0.003)"
+            )
+        component, value = (part.strip() for part in item.split("=", 1))
+        try:
+            rates[component] = float(value)
+        except ValueError:
+            raise ValueError(
+                f"Learning rate for {component!r} is not a number: {value!r}"
+            )
+    return rates
