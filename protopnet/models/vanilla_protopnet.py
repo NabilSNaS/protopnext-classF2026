@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -107,6 +107,7 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         trainable_components: Optional[Mapping[str, Iterable[str]]] = None,
         freeze_batchnorm: bool = False,
         stage_learning_rates: Optional[Mapping[str, Mapping[str, float]]] = None,
+        stage_order: Optional[Sequence[Mapping[str, Any]]] = None,
         phase_config_kwargs: Dict[str, Any] = {},
         extra_training_metrics: Optional[TrainingMetrics] = None,
     ):
@@ -140,6 +141,17 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
                 normal rate (add_on_lr, backbone_lr, prototype_lr, pred_head_lr). Example:
                 {"joint": {"add_on_layers": 0.001}, "last_only": {"prototype_prediction_head": 0.0005}}
                 A rate can only be set for a component that trains in that stage.
+            - stage_order: the order of stages as a list, replacing the standard
+                ProtoPNet order. Each item is either ``{"stage": name, "epochs": n}``
+                (name is "warm", "joint", "last_only" or "project"; project takes no
+                epochs) or ``{"repeat": n, "stages": [...]}`` with a list of such stages.
+                Stages with 0 epochs and repeats of 0 are skipped. When given, the epoch
+                arguments above (num_warm_epochs, ..., final_last_only_epochs) are not used.
+                Example:
+                [{"stage": "warm", "epochs": 5}, {"stage": "project"},
+                 {"repeat": 3, "stages": [{"stage": "last_only", "epochs": 10},
+                                          {"stage": "joint", "epochs": 5},
+                                          {"stage": "project"}]}]
         """
         if last_only_loss is None:
             last_only_loss = loss
@@ -288,16 +300,27 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
             else []
         )
 
-        super().__init__(
-            default_eval_phase=eval,
-            phases=[
+        if stage_order is None:
+            phases = [
                 *stage(warm, num_warm_epochs),  # skipped if 0
                 *stage(joint, num_preproject_joint_epochs),  # skipped if 0
                 *stage(project),
                 *maybe_iterative_phase,
                 *stage(last_only, final_last_only_epochs),  # own epoch count
-            ],
-        )
+            ]
+        else:
+            # A user-defined order of stages (e.g. from a schedule config file)
+            phases = build_phases_from_stage_order(
+                stage_order,
+                {
+                    "warm": warm,
+                    "joint": joint,
+                    "last_only": last_only,
+                    "project": project,
+                },
+            )
+
+        super().__init__(default_eval_phase=eval, phases=phases)
 
         # Keep the resolved settings so they can be printed or checked
         self._stage_trainable = stage_trainable
@@ -451,3 +474,106 @@ def parse_learning_rate_string(text: str) -> Dict[str, float]:
                 f"Learning rate for {component!r} is not a number: {value!r}"
             )
     return rates
+
+
+#: Stage names that can appear in a ``stage_order``.
+STAGE_NAMES = ("warm", "joint", "last_only", "project")
+
+
+def build_phases_from_stage_order(
+    stage_order: Sequence[Mapping[str, Any]],
+    stage_phases: Mapping[str, Any],
+) -> List[Union[Phase, IterativePhase]]:
+    """
+    Turn a list of stages and repeat blocks into schedule phases.
+
+    Each item is ``{"stage": name, "epochs": n}`` or ``{"repeat": n, "stages": [...]}``.
+    ``project`` takes no epochs (it is always one step). Stages with 0 epochs and
+    repeat blocks with 0 repeats are skipped. Repeat blocks cannot be nested.
+    Raises ValueError with the position of the problem for any invalid item.
+    """
+    if isinstance(stage_order, (str, bytes)) or not isinstance(stage_order, Sequence):
+        raise ValueError(
+            f"The stage order must be a list, got {type(stage_order).__name__}"
+        )
+    if not stage_order:
+        raise ValueError("The stage order is empty; it needs at least one stage.")
+
+    phases: List[Union[Phase, IterativePhase]] = []
+    for position, item in enumerate(stage_order, start=1):
+        where = f"item {position}"
+        if isinstance(item, Mapping) and "repeat" in item:
+            phases.extend(_repeat_block(item, stage_phases, where))
+        else:
+            phases.extend(_single_stage(item, stage_phases, where))
+
+    if not phases:
+        raise ValueError(
+            "Every stage in the stage order has 0 epochs or 0 repeats, "
+            "so there is nothing to train."
+        )
+    return phases
+
+
+def _single_stage(
+    item: Any, stage_phases: Mapping[str, Any], where: str
+) -> List[Phase]:
+    """One ``{"stage": name, "epochs": n}`` item as a list of 0 or 1 phases."""
+    if not isinstance(item, Mapping) or "stage" not in item:
+        raise ValueError(
+            f"{where}: expected {{stage: <name>, epochs: <n>}} or "
+            f"{{repeat: <n>, stages: [...]}}, got {item!r}"
+        )
+    unknown_keys = set(item) - {"stage", "epochs"}
+    if unknown_keys:
+        raise ValueError(
+            f"{where}: unknown key(s) {sorted(unknown_keys)}; "
+            "a stage only takes 'stage' and 'epochs'"
+        )
+
+    name = item["stage"]
+    if name not in STAGE_NAMES:
+        raise ValueError(
+            f"{where}: unknown stage {name!r}. Valid stages: {list(STAGE_NAMES)}"
+        )
+
+    if name == "project":
+        if "epochs" in item:
+            raise ValueError(
+                f"{where}: 'project' takes no epochs (it is always a single step)"
+            )
+        return [Phase(train=stage_phases[name])]
+
+    if "epochs" not in item:
+        raise ValueError(f"{where}: stage {name!r} needs an 'epochs' value")
+    epochs = item["epochs"]
+    validate_epoch_counts(**{f"{where} ({name}) epochs": epochs})
+    return [Phase(train=stage_phases[name], duration=epochs)] if epochs > 0 else []
+
+
+def _repeat_block(
+    item: Mapping[str, Any], stage_phases: Mapping[str, Any], where: str
+) -> List[IterativePhase]:
+    """One ``{"repeat": n, "stages": [...]}`` item as a list of 0 or 1 phases."""
+    unknown_keys = set(item) - {"repeat", "stages"}
+    if unknown_keys:
+        raise ValueError(
+            f"{where}: unknown key(s) {sorted(unknown_keys)}; "
+            "a repeat block only takes 'repeat' and 'stages'"
+        )
+    validate_epoch_counts(**{f"{where} repeat": item["repeat"]})
+
+    inner = item.get("stages")
+    if isinstance(inner, (str, bytes)) or not isinstance(inner, Sequence) or not inner:
+        raise ValueError(f"{where}: a repeat block needs a non-empty 'stages' list")
+
+    cycle: List[Phase] = []
+    for inner_position, inner_item in enumerate(inner, start=1):
+        inner_where = f"{where}, stage {inner_position}"
+        if isinstance(inner_item, Mapping) and "repeat" in inner_item:
+            raise ValueError(f"{inner_where}: repeat blocks cannot be nested")
+        cycle.extend(_single_stage(inner_item, stage_phases, inner_where))
+
+    if item["repeat"] == 0 or not cycle:
+        return []
+    return [IterativePhase(phases=cycle, iterations=item["repeat"])]

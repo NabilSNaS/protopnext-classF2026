@@ -260,6 +260,61 @@ To check a configuration without training, add `--dry-run`: the resolved schedul
 
 Invalid settings stop the run before training with a clear error, for example a misspelled component name (`--warm-trainable backbon`), a negative epoch count, or a learning rate for a component that is frozen in that stage (`--warm-lr backbone=0.1`).
 
+#### Schedule config files
+
+Instead of command-line options, the whole schedule can be written in a YAML file and passed with `--schedule-config`.
+A config file can also change the **order** of stages, add or remove stages, and change what repeats, without editing code.
+
+```bash
+python -m protopnet train-protopnet --schedule-config configs/schedules/protopnet_default.yaml
+```
+
+`configs/schedules/protopnet_default.yaml` reproduces the default schedule exactly; copy it as a starting point.
+`configs/schedules/example_frozen_backbone.yaml` shows a customised schedule.
+
+```yaml
+stages:                      # settings per stage (all optional)
+  warm:
+    trainable: [add_on_layers, prototype_layer]
+  joint:
+    trainable: [add_on_layers, prototype_layer]   # keep the backbone frozen
+    lr: {add_on_layers: 0.001}
+  last_only:
+    trainable: [prototype_prediction_head, add_on_layers]
+    lr: {add_on_layers: 0.0005}
+
+freeze_batchnorm: true
+
+schedule:                    # order in which stages run
+  - {stage: warm, epochs: 3}
+  - {stage: joint, epochs: 5}
+  - {stage: project}
+  - repeat: 5
+    stages:
+      - {stage: last_only, epochs: 5}
+      - {stage: joint, epochs: 3}
+      - {stage: project}
+  - {stage: last_only, epochs: 15}
+```
+
+| Section | Meaning |
+|---|---|
+| `stages.<stage>.trainable` | components trained in `warm`, `joint` or `last_only` (same as `--*-trainable`) |
+| `stages.<stage>.lr` | learning rate per component in that stage (same as `--*-lr`) |
+| `freeze_batchnorm` | `true` / `false` (same as `--freeze-batchnorm`) |
+| `schedule` | list of `{stage: <name>, epochs: <n>}` (`warm`, `joint`, `last_only`), `{stage: project}`, and `{repeat: <n>, stages: [...]}` blocks |
+
+Rules:
+
+- Every section is optional; anything left out keeps the default. Without `schedule`, the standard stage order and lengths are used.
+- A stage with `epochs: 0` and a block with `repeat: 0` are skipped. `project` takes no epochs. Repeat blocks cannot be nested.
+- All stages of the same name share one optimizer, as in the default schedule (e.g. every `joint` stage continues the same Adam state and step-decay scheduler).
+- Epochs in the file are multiplied by `--phase-multiplier`. With `--verify`, every stage runs one epoch and every repeat block runs once.
+- `--schedule-config` cannot be combined with the per-stage options above (`--*-epochs`, `--num-cycles`, `--*-trainable`, `--*-lr`, `--freeze-batchnorm`); the run stops with an error naming the conflicting option.
+- Mistakes are reported before training with their position, e.g. `item 4, stage 2: unknown stage 'lastonly'`.
+
+Add `--dry-run` to print the resulting schedule, the trainable components and the learning rates of every stage without training.
+
 ## Datasets
 
 Available datasets:
@@ -297,6 +352,17 @@ schedule = ProtoPNetTrainingSchedule(
 )
 schedule.stage_trainable_components  # resolved components per stage
 schedule.stage_learning_rates        # resolved learning rates per stage
+```
+
+A custom stage order can be passed as `stage_order` (the same list as the `schedule` section of a config file), and a config file can be loaded with `protopnet.schedule_config.load_schedule_config`:
+
+```python
+from protopnet.schedule_config import load_schedule_config
+
+schedule = ProtoPNetTrainingSchedule(
+    ...,
+    **load_schedule_config("configs/schedules/protopnet_default.yaml"),
+)
 ```
 
 Which layers a `ClassificationBackpropPhase` trains is set by its `set_training_layers_fn`:

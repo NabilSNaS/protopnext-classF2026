@@ -15,6 +15,7 @@ from .losses import ClassAwareExtraCalculations
 from .model_losses import loss_for_coefficients
 from .models.vanilla_protopnet import ProtoPNetTrainingSchedule, VanillaProtoPNet
 from .pixel_space import BilinearUpsampleActivations
+from .schedule_config import load_schedule_config, scale_stage_order
 from .train.logging.weights_and_biases import WeightsAndBiasesTrainLogger
 from .train.scheduling import Phase, PrunePrototypesPhase, RSampleInitPhase
 from .train.scheduling.early_stopping import ProjectPatienceEarlyStopping
@@ -108,6 +109,14 @@ log = logging.getLogger(__name__)
     default=None,
     help="Learning rates during last-layer stages, e.g. 'prototype_prediction_head=0.0001'.",
 )
+# A YAML file that defines the whole schedule (instead of the per-stage options)
+@click.option(
+    "--schedule-config",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="YAML file defining the training schedule: stage order, epochs, trainable "
+    "components and learning rates. Cannot be combined with the per-stage options.",
+)
 # Keep BatchNorm statistics fixed in frozen components
 @click.option(
     "--freeze-batchnorm",
@@ -157,6 +166,7 @@ def run(
     warm_lr=None,
     joint_lr=None,
     last_only_lr=None,
+    schedule_config=None,
 ):
     """
     Train a Vanilla ProtoPNet.
@@ -196,7 +206,38 @@ def run(
     - warm_lr / joint_lr / last_only_lr: str - per-stage learning rates as
       "component=rate,component=rate". Components not listed keep their normal rate.
       Only components that train in that stage can be given a rate. Not scaled by lr_multiplier.
+    - schedule_config: str - path to a YAML schedule config file (see README, "Schedule config files").
+      Replaces the per-stage options above, which cannot be used together with it. Epochs in the file
+      are multiplied by phase_multiplier; in verify mode every stage runs 1 epoch and each repeat runs once.
     """
+
+    if schedule_config is not None:
+        # A config file replaces the per-stage options; mixing them would be ambiguous
+        per_stage_options = {
+            "--warm-epochs": warm_epochs,
+            "--preproject-joint-epochs": preproject_joint_epochs,
+            "--joint-epochs-per-cycle": joint_epochs_per_cycle,
+            "--last-only-epochs-per-cycle": last_only_epochs_per_cycle,
+            "--num-cycles": num_cycles,
+            "--final-last-only-epochs": final_last_only_epochs,
+            "--warm-trainable": warm_trainable,
+            "--joint-trainable": joint_trainable,
+            "--last-only-trainable": last_only_trainable,
+            "--freeze-batchnorm": freeze_batchnorm or None,
+            "--warm-lr": warm_lr,
+            "--joint-lr": joint_lr,
+            "--last-only-lr": last_only_lr,
+        }
+        used = [name for name, value in per_stage_options.items() if value is not None]
+        if used:
+            raise click.UsageError(
+                f"--schedule-config cannot be combined with {', '.join(used)}; "
+                "put these settings in the config file instead."
+            )
+        config_kwargs = load_schedule_config(schedule_config)
+        log.info("Using schedule config %s: %s", schedule_config, config_kwargs)
+    else:
+        config_kwargs = None
 
     # Per-stage flags override the shared defaults when given
     if joint_epochs_per_cycle is not None:
@@ -291,6 +332,37 @@ def run(
         class_specific_cluster=class_specific,
     ).to(setup["device"])
 
+    if config_kwargs is None:
+        # Pass only the stages the user actually set; the rest keep their defaults
+        trainable_components = {
+            stage: components
+            for stage, components in (
+                ("warm", warm_trainable),
+                ("joint", joint_trainable),
+                ("last_only", last_only_trainable),
+            )
+            if components is not None
+        }
+        stage_learning_rates = {
+            stage: rates
+            for stage, rates in (
+                ("warm", warm_lr),
+                ("joint", joint_lr),
+                ("last_only", last_only_lr),
+            )
+            if rates is not None
+        }
+        stage_order = None
+    else:
+        trainable_components = config_kwargs.get("trainable_components")
+        stage_learning_rates = config_kwargs.get("stage_learning_rates")
+        freeze_batchnorm = config_kwargs.get("freeze_batchnorm", False)
+        stage_order = config_kwargs.get("stage_order")
+        if stage_order is not None:
+            stage_order = scale_stage_order(
+                stage_order, multiplier=phase_multiplier, verify=verify
+            )
+
     # TODO: add L1 term only for last_only
     training_schedule = ProtoPNetTrainingSchedule(
         model=vppn,
@@ -325,26 +397,10 @@ def run(
             if final_last_only_epochs is None
             else final_last_only_epochs * phase_multiplier
         ),
-        # Pass only the stages the user actually set; the rest keep their defaults
-        trainable_components={
-            stage: components
-            for stage, components in (
-                ("warm", warm_trainable),
-                ("joint", joint_trainable),
-                ("last_only", last_only_trainable),
-            )
-            if components is not None
-        },
+        trainable_components=trainable_components,
         freeze_batchnorm=freeze_batchnorm,
-        stage_learning_rates={
-            stage: rates
-            for stage, rates in (
-                ("warm", warm_lr),
-                ("joint", joint_lr),
-                ("last_only", last_only_lr),
-            )
-            if rates is not None
-        },
+        stage_learning_rates=stage_learning_rates,
+        stage_order=stage_order,
         phase_config_kwargs={
             "device": setup["device"],
             "post_forward_calculations": post_forward_calculations,
@@ -361,7 +417,11 @@ def run(
         ),
     )
 
-    # Print the learning rate of every component in every stage
+    # Print what trains in every stage, and at which learning rate
+    log.info(
+        "Trainable components per stage: %s",
+        training_schedule.stage_trainable_components,
+    )
     log.info("Learning rates per stage: %s", training_schedule.stage_learning_rates)
 
     if verify:
